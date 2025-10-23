@@ -1,0 +1,7 @@
+# Ignore binary files
+*.bin
+*.pem
+
+# Ignore environment files
+.env
+test_result.txt
