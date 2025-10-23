@@ -27,12 +27,13 @@ if TYPE_CHECKING:
     from azure.storage.blob import BlobServiceClient  # type: ignore
 
 # === CONFIG ===
-SELLER_PRIVATE_KEY_PATH = "/home/azureuser/zdatar/test-script/seller_1_sk.pem"
-BUYER_PUBLIC_KEY_PATH = "/home/azureuser/zdatar/test-script/buyer_0_pk.pem"
-DATASET_PATH = "/home/azureuser/zdatar/test-script/test_dataset.csv"
-ENCRYPTED_FILE_PATH = "/home/azureuser/zdatar/test-script/test_dataset_encrypted.bin"
-ENCRYPTED_AES_KEY_BUYER_PATH = "/home/azureuser/zdatar/test-script/encrypted_aes_key_buyer.bin"
-ENCRYPTED_AES_KEY_SELLER_PATH = "/home/azureuser/zdatar/test-script/encrypted_aes_key_seller.bin"
+SELLER_PRIVATE_KEY_PATH = "/home/azureuser/zdatar/data_enc_utils/seller_1_sk.pem"
+SELLER_PUBLIC_KEY_PATH = "/home/azureuser/zdatar/data_enc_utils/seller_1_pk.pem"
+BUYER_PUBLIC_KEY_PATH = "/home/azureuser/zdatar/data_enc_utils/buyer_0_pk.pem"
+DATASET_PATH = "/home/azureuser/zdatar/data_enc_utils/test_dataset.csv"
+ENCRYPTED_FILE_PATH = "/home/azureuser/zdatar/data_enc_utils/test_dataset_encrypted.bin"
+ENCRYPTED_AES_KEY_BUYER_PATH = "/home/azureuser/zdatar/data_enc_utils/encrypted_aes_key_buyer.bin"
+ENCRYPTED_AES_KEY_SELLER_PATH = "/home/azureuser/zdatar/data_enc_utils/encrypted_aes_key_seller.bin"
 
 load_dotenv()
 AZURE_CONNECTION_STRING = os.getenv("AZURE_CONNECTION_STRING")
@@ -310,22 +311,67 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     seller_pk: Optional[Union[str, Any]] = None
     if args.encrypt_for in ('seller', 'both'):
-        # Prefer explicit seller public key path if provided
-        if args.seller_pk:
+        # Decide which public-key path to use: explicit CLI arg wins, otherwise default
+        seller_pk_path = args.seller_pk if args.seller_pk else SELLER_PUBLIC_KEY_PATH
+
+        # If a public key file already exists, load and use it.
+        if os.path.exists(seller_pk_path):
             try:
-                raw = open(args.seller_pk, 'rb').read()
+                raw = open(seller_pk_path, 'rb').read()
                 if is_solana_base58_key(raw):
                     seller_pk = raw.decode('utf-8').strip()
                 else:
-                    seller_pk = load_rsa_public_key(args.seller_pk)
+                    seller_pk = load_rsa_public_key(seller_pk_path)
             except Exception as e:
-                print(f"❌ Error loading seller public key from {args.seller_pk}: {e}")
+                print(f"❌ Error loading seller public key from {seller_pk_path}: {e}")
                 return
         else:
+            # Derive public key from seller private key and save it to the chosen path.
             try:
-                seller_pk = derive_rsa_public_from_private(args.seller_sk)
+                derived = derive_rsa_public_from_private(args.seller_sk)
             except Exception as e:
                 print(f"❌ Error deriving seller public key from {args.seller_sk}: {e}")
+                return
+
+            # Persist the derived public key to file in a best-effort format:
+            # - If it's a Solana/base58 string, write text
+            # - If it's raw bytes, write bytes
+            # - Otherwise try to serialize as PEM using rsa.PublicKey.save_pkcs1 if available
+            try:
+                if isinstance(derived, str):
+                    # Solana-style base58 string
+                    with open(seller_pk_path, 'w', encoding='utf-8') as f:
+                        f.write(derived)
+                    seller_pk = derived
+                elif isinstance(derived, (bytes, bytearray)):
+                    with open(seller_pk_path, 'wb') as f:
+                        f.write(bytes(derived))
+                    seller_pk = bytes(derived)
+                else:
+                    # Try to call a save method on the object (rsa.PublicKey has save_pkcs1)
+                    try:
+                        if hasattr(derived, 'save_pkcs1'):
+                            pem = derived.save_pkcs1()  # type: ignore
+                        else:
+                            # fallback: try rsa module helper
+                            _rsa = importlib.import_module('rsa')
+                            pem = getattr(_rsa.PublicKey, 'save_pkcs1')(derived)  # type: ignore
+                        with open(seller_pk_path, 'wb') as f:
+                            f.write(pem)
+                        seller_pk = derived
+                    except Exception:
+                        # As a last resort, try to write numeric components as JSON [n,e]
+                        try:
+                            n = getattr(derived, 'n')
+                            e = getattr(derived, 'e')
+                            with open(seller_pk_path, 'w', encoding='utf-8') as f:
+                                f.write(json.dumps([int(n), int(e)]))
+                            seller_pk = derived
+                        except Exception as e:
+                            print(f"❌ Unable to serialize derived public key to {seller_pk_path}: {e}")
+                            return
+            except Exception as e:
+                print(f"❌ Failed saving derived seller public key to {seller_pk_path}: {e}")
                 return
 
     aes_key = generate_aes_key()
