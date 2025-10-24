@@ -1,0 +1,8 @@
+rsa
+cryptography
+base58
+python-dotenv
+requests
+azure-storage-blob
+ipfshttpclient
+pynacl
