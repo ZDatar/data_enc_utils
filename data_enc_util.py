@@ -34,6 +34,7 @@ DATASET_PATH = "/home/azureuser/zdatar/data_enc_utils/test_dataset.csv"
 ENCRYPTED_FILE_PATH = "/home/azureuser/zdatar/data_enc_utils/test_dataset_encrypted.bin"
 ENCRYPTED_AES_KEY_BUYER_PATH = "/home/azureuser/zdatar/data_enc_utils/encrypted_aes_key_buyer.bin"
 ENCRYPTED_AES_KEY_SELLER_PATH = "/home/azureuser/zdatar/data_enc_utils/encrypted_aes_key_seller.bin"
+ENCRYPTED_AES_KEYS_COMBINED_PATH = "/home/azureuser/zdatar/data_enc_utils/encrypted_aes_keys.json"
 
 load_dotenv()
 AZURE_CONNECTION_STRING = os.getenv("AZURE_CONNECTION_STRING")
@@ -113,11 +114,27 @@ def encrypt_aes_key_with_solana(aes_key: bytes, sol_base58_str: str) -> bytes:
     return cast(bytes, box.encrypt(aes_key))  # type: ignore
 
 
-def encrypt_for_recipient(aes_key: bytes, recipient_pk: Union[str, Any]) -> bytes:
-    if isinstance(recipient_pk, str):
-        return encrypt_aes_key_with_solana(aes_key, recipient_pk)
-    _rsa = importlib.import_module('rsa')
-    return getattr(_rsa, 'encrypt')(aes_key, recipient_pk)  # type: ignore
+def encrypt_for_recipient(aes_key: bytes, recipient_pk: Union[str, Any], is_re_encryption: bool = False) -> bytes:
+    # For re-encryption, we create a temporary AES key and encrypt both the original key and temporary key
+    if is_re_encryption:
+        temp_key = os.urandom(32)  # Generate temporary key for re-encryption
+        # Encrypt the original AES key with temp key
+        cipher = Cipher(algorithms.AES(temp_key), modes.CFB(os.urandom(16)), backend=default_backend())
+        encryptor = cipher.encryptor()
+        encrypted_original = encryptor.update(aes_key) + encryptor.finalize()
+        # Now encrypt temp key for recipient
+        if isinstance(recipient_pk, str):
+            encrypted_temp = encrypt_aes_key_with_solana(temp_key, recipient_pk)
+        else:
+            _rsa = importlib.import_module('rsa')
+            encrypted_temp = getattr(_rsa, 'encrypt')(temp_key, recipient_pk)  # type: ignore
+        # Combine both encrypted keys with a marker
+        return b'PRE:' + len(encrypted_temp).to_bytes(4, 'big') + encrypted_temp + encrypted_original
+    else:
+        if isinstance(recipient_pk, str):
+            return encrypt_aes_key_with_solana(aes_key, recipient_pk)
+        _rsa = importlib.import_module('rsa')
+        return getattr(_rsa, 'encrypt')(aes_key, recipient_pk)  # type: ignore
 
 
 def derive_rsa_public_from_private(private_path: str) -> Any:
@@ -283,6 +300,23 @@ def make_encrypted_keys_json(paths: Dict[str, str]) -> str:
     return json.dumps(out, indent=2)
 
 
+def make_encrypted_keys_json_from_bytes(items: Dict[str, bytes]) -> str:
+    """Create the same JSON structure as make_encrypted_keys_json but from in-memory bytes.
+
+    items: mapping from label -> encrypted bytes
+    """
+    out: Dict[str, Any] = {"recipients": {}}
+    for label, b in items.items():
+        out['recipients'][label] = {
+            'file': None,
+            'encryptedKey': base64.b64encode(b).decode('utf-8'),
+            'format': 'base64',
+            'sha256': hashlib.sha256(b).hexdigest(),
+            'sha256_base64': base64.b64encode(hashlib.sha256(b).digest()).decode('utf-8'),
+        }
+    return json.dumps(out, indent=2)
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(description='Encrypt dataset and AES key for recipients')
     parser.add_argument('--encrypt-for', choices=['buyer', 'seller', 'both'], default='both', help='Who to encrypt the AES key for')
@@ -378,23 +412,59 @@ def main(argv: Optional[List[str]] = None) -> None:
     encrypt_file_with_aes(DATASET_PATH, ENCRYPTED_FILE_PATH, aes_key)
 
     out_paths: Dict[str, str] = {}
+    encrypted_items: Dict[str, bytes] = {}
+
+    # Buyer
     if args.encrypt_for in ('buyer', 'both'):
         if buyer_pk is None:
             print("❌ Buyer public key not loaded; cannot encrypt AES key for buyer")
             return
-        c = encrypt_for_recipient(aes_key, buyer_pk)
-        with open(ENCRYPTED_AES_KEY_BUYER_PATH, 'wb') as f:
-            f.write(c)
-        out_paths['buyer'] = ENCRYPTED_AES_KEY_BUYER_PATH
+        c_buyer = encrypt_for_recipient(aes_key, buyer_pk)
+        if args.encrypt_for == 'both':
+            encrypted_items['buyer'] = c_buyer
+        else:
+            with open(ENCRYPTED_AES_KEY_BUYER_PATH, 'wb') as f:
+                f.write(c_buyer)
+            out_paths['buyer'] = ENCRYPTED_AES_KEY_BUYER_PATH
 
+    # Seller
     if args.encrypt_for in ('seller', 'both'):
         if seller_pk is None:
             print("❌ Seller public key not available; cannot encrypt AES key for seller")
             return
-        c = encrypt_for_recipient(aes_key, seller_pk)
-        with open(ENCRYPTED_AES_KEY_SELLER_PATH, 'wb') as f:
-            f.write(c)
-        out_paths['seller'] = ENCRYPTED_AES_KEY_SELLER_PATH
+        c_seller = encrypt_for_recipient(aes_key, seller_pk)
+        if args.encrypt_for == 'both':
+            encrypted_items['seller'] = c_seller
+        else:
+            with open(ENCRYPTED_AES_KEY_SELLER_PATH, 'wb') as f:
+                f.write(c_seller)
+            out_paths['seller'] = ENCRYPTED_AES_KEY_SELLER_PATH
+
+    # If both recipients are requested, we'll use proxy re-encryption approach to allow
+    # both parties to decrypt with their own keys
+    combined_json: Optional[str] = None
+    if args.encrypt_for == 'both':
+        if buyer_pk is None or seller_pk is None:
+            print("❌ Both buyer and seller public keys required for proxy re-encryption")
+            return
+
+        # First encrypt for the seller (primary recipient)
+        c_seller = encrypt_for_recipient(aes_key, seller_pk)
+        
+        # Then create a re-encryption for the buyer that allows decryption with buyer's key
+        c_buyer = encrypt_for_recipient(aes_key, buyer_pk, is_re_encryption=True)
+        
+        encrypted_items['seller'] = c_seller
+        encrypted_items['buyer'] = c_buyer
+        
+        combined_json = make_encrypted_keys_json_from_bytes(encrypted_items)
+        try:
+            with open(ENCRYPTED_AES_KEYS_COMBINED_PATH, 'w', encoding='utf-8') as f:
+                f.write(combined_json)
+        except Exception as e:
+            print(f"❌ Failed to write combined encrypted keys to {ENCRYPTED_AES_KEYS_COMBINED_PATH}: {e}")
+            return
+        out_paths['both'] = ENCRYPTED_AES_KEYS_COMBINED_PATH
 
     ipfs_cid = upload_to_ipfs(ENCRYPTED_FILE_PATH)
     azure_url = upload_to_azure(ENCRYPTED_FILE_PATH)

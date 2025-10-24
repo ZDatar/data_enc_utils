@@ -1,0 +1,18 @@
+{
+  "recipients": {
+    "buyer": {
+      "file": null,
+      "encryptedKey": "UFJFOgAAAFA+FRmwmQORXukuwUpZwfMFD8/mk+5VZ7mmI2WW8v41L41U/wJ/eJPOrIjV6NTqtf6PR6tpXKAv62p2NAU/953TIYdNt1Xtk9ak1C3egKCWxG+9Q9k8kJTIl491PdZmToAikaQ63a48JPBCtfBHTNnB",
+      "format": "base64",
+      "sha256": "10d41eb152343e78c657cecfcda206238efe2732ffd20b5add96f7997123cd36",
+      "sha256_base64": "ENQesVI0PnjGV87PzaIGI47+JzL/0gta3Zb3mXEjzTY="
+    },
+    "seller": {
+      "file": null,
+      "encryptedKey": "U9oSU1c6McF1dzn0lJ20vt0No7rTivk7y0J3141Hs3+htBObgUhSnXVcSdPH9wltCxqGdR1mkJLBO+MP7p1NftAmRD1nUm5hSdeQR452p1g=",
+      "format": "base64",
+      "sha256": "a215506e09db7e61341b75dabf1b1109d14f6828a34ad475604c601f330de694",
+      "sha256_base64": "ohVQbgnbfmE0G3XavxsRCdFPaCijStR1YExgHzMN5pQ="
+    }
+  }
+}
