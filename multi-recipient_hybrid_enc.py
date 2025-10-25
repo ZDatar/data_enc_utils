@@ -1,5 +1,32 @@
 # multi_recipient_hpke_like.py
 # Requires: pip install cryptography
+# Multi-recipient hybrid encryption with X25519 + HKDF + AES-GCM.
+# ■ Encrypt once with a random data key; wrap that key separately for PKa and PKb (and any N recipients).
+#   □ Output is a JSON envelope; any recipient can unwrap K and decrypt the ciphertext.
+#       ◆ No external services required; uses cryptography only.
+#           ◇ Run pip install cryptography.
+# • Notes
+#   ◦ Security properties
+#       ■ Confidentiality & integrity come from AES-GCM; header is authenticated via AAD, so recipients/params are bound to the ciphertext.
+#           □ Forward secrecy is provided per recipient via ephemeral X25519 ECDH.
+#                ◆ Nonces are unique random 12-byte values; never reuse with the same key.
+#                   ◇ You can add more recipients by appending more wrapped-key entries without re-encrypting the data.
+#   ◦ Integrations
+#       ■ Use your existing key IDs (kid) from wallet/registry.
+#           □ For proxy re-encryption later, keep a single recipient initially (seller) and let EPS transform the key-wrap to the buyer on deal.
+#                ◆ To store on IPFS/Azure, keep the envelope JSON alongside the data blob CID/URL or embed the CID/URL inside an authenticated AAD field.
+# 
+# Solana keypair basics
+# ◦ Solana uses Ed25519 keys (for signatures).
+#   ■ A Solana wallet’s keypair (SKsol, PKsol) is based on Ed25519.
+#       □ Ed25519 is for signing (EdDSA).
+#           ◆ The encryption algorithm in the Python code above uses X25519, which is for key exchange (ECDH).
+#               ◇ These two curves (Ed25519 and X25519) share the same underlying field but use different formulas and different encodings.
+# Relationship between Ed25519 and X25519
+# ◦ You can convert between them safely because they are both built on Curve25519.
+#   ■ If you have an Ed25519 private key (like from Solana), you can derive the corresponding X25519 private key deterministically.
+#       □ Once converted, you can use it with the exact same encryption scheme I gave you.
+#           ◆ This is the same approach used by libsodium (crypto_sign_ed25519_sk_to_curve25519 and crypto_sign_ed25519_pk_to_curve25519).
 
 import base64
 import json
