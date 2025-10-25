@@ -10,3 +10,6 @@ test_result.txt
 # Ignore decrypted and testing files
 decrypted_dataset.csv
 encrypted_aes_keys.json
+
+# Ignore compiled Python files
+__pycache__/
