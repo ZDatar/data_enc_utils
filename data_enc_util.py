@@ -61,6 +61,12 @@ if TYPE_CHECKING:
     # we import dynamically to avoid hard dependency.
     import rsa  # type: ignore
     from azure.storage.blob import BlobServiceClient  # type: ignore
+    from nacl.signing import SigningKey as NaClSigningKey  # type: ignore
+else:  # pragma: no cover - typing fallback
+    NaClSigningKey = Any  # type: ignore
+
+
+SolanaSecretSource = Union[bytes, bytearray, memoryview, NaClSigningKey]
 
 # === CONFIGURATION ===
 # Default file paths - can be overridden via command-line arguments
@@ -203,9 +209,18 @@ def load_rsa_private_key(path: str) -> Any:
         # try JSON array of ints
         if not raw:
             try:
-                arr = json.loads(text)
-                if isinstance(arr, list) and all(isinstance(x, int) for x in arr):
-                    raw = bytes(cast(List[int], arr))
+                arr_obj = json.loads(text)
+                if isinstance(arr_obj, list):
+                    arr_items = cast(Sequence[object], arr_obj)
+                    int_items: List[int] = []
+                    invalid_item = False
+                    for item_obj in arr_items:
+                        if not isinstance(item_obj, int):
+                            invalid_item = True
+                            break
+                        int_items.append(int(item_obj))
+                    if not invalid_item:
+                        raw = bytes(int_items)
             except Exception:
                 pass
         
@@ -293,11 +308,15 @@ def decrypt_aes_key_with_solana(encrypted_key: bytes, private_key: Any) -> bytes
     SealedBox = getattr(_nacl_public, 'SealedBox')  # type: ignore
     PrivateKey = getattr(_nacl_public, 'PrivateKey')  # type: ignore
     
+    secret_key_source: SolanaSecretSource
+
     # Extract the 64-byte key from the tuple if needed
     if isinstance(private_key, tuple):
-        _, secret_key_bytes = private_key
+        secret_key_source = cast(SolanaSecretSource, private_key[1])
     else:
-        secret_key_bytes = bytes(private_key)
+        secret_key_source = cast(SolanaSecretSource, private_key)
+
+    secret_key_bytes: bytes = bytes(secret_key_source)
     
     try:
         # Convert Ed25519 secret key (64 bytes) to Curve25519 private key (32 bytes)
@@ -900,9 +919,9 @@ def main_decrypt(argv: Optional[List[str]] = None) -> None:
     else:
         try:
             _nacl_signing = importlib.import_module('nacl.signing')
-            SigningKey = getattr(_nacl_signing, 'SigningKey')
+            SigningKeyClass = getattr(_nacl_signing, 'SigningKey')
             # Check if private_key is an instance of SigningKey
-            is_solana = type(private_key).__name__ == 'SigningKey'
+            is_solana = isinstance(private_key, SigningKeyClass)
         except Exception:
             pass
     
@@ -946,10 +965,6 @@ def main_decrypt(argv: Optional[List[str]] = None) -> None:
         except Exception as e:
             logging.error(f"❌ Failed to load encrypted key from {args.encrypted_key}: {e}")
             return
-    
-    if encrypted_aes_key is None:
-        logging.error("❌ Failed to load encrypted AES key")
-        return
     
     # Decrypt the AES key
     try:
