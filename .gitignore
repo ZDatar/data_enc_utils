@@ -5,3 +5,4 @@
 # Ignore environment files
 .env
 test_result.txt
+*.log

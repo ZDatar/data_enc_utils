@@ -317,6 +317,22 @@ def make_encrypted_keys_json_from_bytes(items: Dict[str, bytes]) -> str:
     return json.dumps(out, indent=2)
 
 
+def compute_file_sha256(path: str) -> Optional[str]:
+    """Compute SHA-256 hex digest for a file in a streaming manner.
+
+    Returns hex digest string or None if file can't be read.
+    """
+    try:
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception as e:
+        print(f"⚠️ Could not compute SHA-256 for {path}: {e}")
+        return None
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(description='Encrypt dataset and AES key for recipients')
     parser.add_argument('--encrypt-for', choices=['buyer', 'seller', 'both'], default='both', help='Who to encrypt the AES key for')
@@ -473,6 +489,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     print(f"• Encrypted file: {ENCRYPTED_FILE_PATH}")
     print(f"• IPFS CID: {ipfs_cid}")
     print(f"• Azure URL: {azure_url}")
+    # Also print SHA-256 hash of the encrypted file for verification
+    file_hash = compute_file_sha256(ENCRYPTED_FILE_PATH)
+    if file_hash:
+        print(f"• Encrypted file SHA-256: {file_hash}")
 
     print("\n📋 Encrypted AES Key(s) as JSON:")
     print(make_encrypted_keys_json(out_paths))
