@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 import os
+import sys
 import base64
 import hashlib
 import json
 import mimetypes
 import argparse
+import logging
+from datetime import datetime
 from typing import Any, Dict, Optional, Union, List, Mapping, Sequence, cast
 
 import importlib
@@ -40,6 +43,38 @@ load_dotenv()
 AZURE_CONNECTION_STRING = os.getenv("AZURE_CONNECTION_STRING")
 AZURE_CONTAINER_NAME = "zdatar-data"
 
+# Configure logging
+LOG_FILE_PATH = "/home/azureuser/zdatar/data_enc_utils/data_enc_util.log"
+
+def setup_logging():
+    """Configure logging to output to both console and file."""
+    # Create logger
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    # Remove any existing handlers
+    logger.handlers = []
+    
+    # Create formatters
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console_formatter = logging.Formatter('%(message)s')
+    
+    # File handler
+    file_handler = logging.FileHandler(LOG_FILE_PATH, mode='a', encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(file_formatter)
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(console_formatter)
+    
+    # Add handlers to logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
+
 
 def generate_aes_key() -> bytes:
     return os.urandom(32)
@@ -54,7 +89,7 @@ def encrypt_file_with_aes(input_path: str, output_path: str, aes_key: bytes) -> 
         while chunk := f_in.read(4096):
             f_out.write(encryptor.update(chunk))
         f_out.write(encryptor.finalize())
-    print(f"✅ Encrypted file saved to {output_path}")
+    logging.info(f"✅ Encrypted file saved to {output_path}")
     return iv
 
 
@@ -223,7 +258,7 @@ def derive_rsa_public_from_private(private_path: str) -> Any:
 
 def upload_to_azure(file_path: str) -> Optional[str]:
     if not AZURE_CONNECTION_STRING:
-        print("⚠️ AZURE_CONNECTION_STRING not set; skipped Azure upload.")
+        logging.warning("⚠️ AZURE_CONNECTION_STRING not set; skipped Azure upload.")
         return None
     _blob = importlib.import_module('azure.storage.blob')
     BlobServiceClient = getattr(_blob, 'BlobServiceClient')
@@ -232,7 +267,7 @@ def upload_to_azure(file_path: str) -> Optional[str]:
     with open(file_path, "rb") as data:
         blob_client.upload_blob(data, overwrite=True)  # type: ignore
     url = f"https://{getattr(blob_service, 'account_name')}.blob.core.windows.net/{AZURE_CONTAINER_NAME}/{os.path.basename(file_path)}"
-    print(f"✅ Uploaded to Azure Blob: {url}")
+    logging.info(f"✅ Uploaded to Azure Blob: {url}")
     return url
 
 
@@ -261,10 +296,10 @@ def upload_to_ipfs(file_path: str) -> Optional[str]:
             attr = getattr(cast(object, obj), 'Hash', None)
             if isinstance(attr, str):
                 cid = attr
-        print(f"✅ Uploaded to IPFS: {cid}")
+        logging.info(f"✅ Uploaded to IPFS: {cid}")
         return cid
     except Exception as e:
-        print(f"⚠️ ipfshttpclient failed: {e}")
+        logging.warning(f"⚠️ ipfshttpclient failed: {e}")
 
     try:
         url = 'http://127.0.0.1:5001/api/v0/add'
@@ -275,10 +310,10 @@ def upload_to_ipfs(file_path: str) -> Optional[str]:
         last_line = resp.text.strip().split('\n')[-1]
         obj = json.loads(last_line)
         cid = obj.get('Hash')
-        print(f"✅ Uploaded to IPFS (HTTP API): {cid}")
+        logging.info(f"✅ Uploaded to IPFS (HTTP API): {cid}")
         return cid
     except Exception as e:
-        print(f"⚠️ HTTP IPFS upload fallback failed: {e}")
+        logging.warning(f"⚠️ HTTP IPFS upload fallback failed: {e}")
         return None
 
 
@@ -329,11 +364,25 @@ def compute_file_sha256(path: str) -> Optional[str]:
                 h.update(chunk)
         return h.hexdigest()
     except Exception as e:
-        print(f"⚠️ Could not compute SHA-256 for {path}: {e}")
+        logging.warning(f"⚠️ Could not compute SHA-256 for {path}: {e}")
         return None
 
 
 def main(argv: Optional[List[str]] = None) -> None:
+    # Setup logging first
+    setup_logging()
+    
+    # Log the command line invocation
+    if argv is None:
+        cmd_line = ' '.join(sys.argv)
+    else:
+        cmd_line = f"python {sys.argv[0]} {' '.join(argv)}"
+    
+    logging.info("="*80)
+    logging.info(f"Script invoked: {cmd_line}")
+    logging.info(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logging.info("="*80)
+    
     parser = argparse.ArgumentParser(description='Encrypt dataset and AES key for recipients')
     parser.add_argument('--encrypt-for', choices=['buyer', 'seller', 'both'], default='both', help='Who to encrypt the AES key for')
     parser.add_argument('--buyer-pk', default=BUYER_PUBLIC_KEY_PATH, help='Path to buyer public key (PEM or Solana base58)')
@@ -347,7 +396,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         try:
             raw = open(buyer_pk_path, 'rb').read()
         except Exception as e:
-            print(f"❌ Unable to read buyer public key file '{buyer_pk_path}': {e}")
+            logging.error(f"❌ Unable to read buyer public key file '{buyer_pk_path}': {e}")
             return
 
         if is_solana_base58_key(raw):
@@ -356,7 +405,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             try:
                 buyer_pk = load_rsa_public_key(buyer_pk_path)
             except Exception as e:
-                print(f"❌ Error loading buyer public key: {e}")
+                logging.error(f"❌ Error loading buyer public key: {e}")
                 return
 
     seller_pk: Optional[Union[str, Any]] = None
@@ -373,14 +422,14 @@ def main(argv: Optional[List[str]] = None) -> None:
                 else:
                     seller_pk = load_rsa_public_key(seller_pk_path)
             except Exception as e:
-                print(f"❌ Error loading seller public key from {seller_pk_path}: {e}")
+                logging.error(f"❌ Error loading seller public key from {seller_pk_path}: {e}")
                 return
         else:
             # Derive public key from seller private key and save it to the chosen path.
             try:
                 derived = derive_rsa_public_from_private(args.seller_sk)
             except Exception as e:
-                print(f"❌ Error deriving seller public key from {args.seller_sk}: {e}")
+                logging.error(f"❌ Error deriving seller public key from {args.seller_sk}: {e}")
                 return
 
             # Persist the derived public key to file in a best-effort format:
@@ -418,10 +467,10 @@ def main(argv: Optional[List[str]] = None) -> None:
                                 f.write(json.dumps([int(n), int(e)]))
                             seller_pk = derived
                         except Exception as e:
-                            print(f"❌ Unable to serialize derived public key to {seller_pk_path}: {e}")
+                            logging.error(f"❌ Unable to serialize derived public key to {seller_pk_path}: {e}")
                             return
             except Exception as e:
-                print(f"❌ Failed saving derived seller public key to {seller_pk_path}: {e}")
+                logging.error(f"❌ Failed saving derived seller public key to {seller_pk_path}: {e}")
                 return
 
     aes_key = generate_aes_key()
@@ -433,7 +482,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     # Buyer
     if args.encrypt_for in ('buyer', 'both'):
         if buyer_pk is None:
-            print("❌ Buyer public key not loaded; cannot encrypt AES key for buyer")
+            logging.error("❌ Buyer public key not loaded; cannot encrypt AES key for buyer")
             return
         c_buyer = encrypt_for_recipient(aes_key, buyer_pk)
         if args.encrypt_for == 'both':
@@ -446,7 +495,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     # Seller
     if args.encrypt_for in ('seller', 'both'):
         if seller_pk is None:
-            print("❌ Seller public key not available; cannot encrypt AES key for seller")
+            logging.error("❌ Seller public key not available; cannot encrypt AES key for seller")
             return
         c_seller = encrypt_for_recipient(aes_key, seller_pk)
         if args.encrypt_for == 'both':
@@ -461,7 +510,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     combined_json: Optional[str] = None
     if args.encrypt_for == 'both':
         if buyer_pk is None or seller_pk is None:
-            print("❌ Both buyer and seller public keys required for proxy re-encryption")
+            logging.error("❌ Both buyer and seller public keys required for proxy re-encryption")
             return
 
         # First encrypt for the seller (primary recipient)
@@ -478,24 +527,24 @@ def main(argv: Optional[List[str]] = None) -> None:
             with open(ENCRYPTED_AES_KEYS_COMBINED_PATH, 'w', encoding='utf-8') as f:
                 f.write(combined_json)
         except Exception as e:
-            print(f"❌ Failed to write combined encrypted keys to {ENCRYPTED_AES_KEYS_COMBINED_PATH}: {e}")
+            logging.error(f"❌ Failed to write combined encrypted keys to {ENCRYPTED_AES_KEYS_COMBINED_PATH}: {e}")
             return
         out_paths['both'] = ENCRYPTED_AES_KEYS_COMBINED_PATH
 
     ipfs_cid = upload_to_ipfs(ENCRYPTED_FILE_PATH)
     azure_url = upload_to_azure(ENCRYPTED_FILE_PATH)
 
-    print("\n🔐 Re-Encryption & Upload Summary:")
-    print(f"• Encrypted file: {ENCRYPTED_FILE_PATH}")
-    print(f"• IPFS CID: {ipfs_cid}")
-    print(f"• Azure URL: {azure_url}")
+    logging.info("\n🔐 Re-Encryption & Upload Summary:")
+    logging.info(f"• Encrypted file: {ENCRYPTED_FILE_PATH}")
+    logging.info(f"• IPFS CID: {ipfs_cid}")
+    logging.info(f"• Azure URL: {azure_url}")
     # Also print SHA-256 hash of the encrypted file for verification
     file_hash = compute_file_sha256(ENCRYPTED_FILE_PATH)
     if file_hash:
-        print(f"• Encrypted file SHA-256: {file_hash}")
+        logging.info(f"• Encrypted file SHA-256: {file_hash}")
 
-    print("\n📋 Encrypted AES Key(s) as JSON:")
-    print(make_encrypted_keys_json(out_paths))
+    logging.info("\n📋 Encrypted AES Key(s) as JSON:")
+    logging.info(make_encrypted_keys_json(out_paths))
 
 
 if __name__ == '__main__':
