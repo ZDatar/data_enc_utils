@@ -13,6 +13,7 @@ This utility encrypts and decrypts datasets for secure sharing between a buyer a
 - [Supported Key Formats](#supported-key-formats)
 - [Configuration](#configuration)
 - [Requirements](#requirements)
+- [Troubleshooting](#troubleshooting)
 - [Notes](#notes)
 
 ## Features
@@ -118,20 +119,24 @@ python data_enc_util.py --encrypt-for both
 
 ### 3. Decrypt the Dataset
 ```bash
-# As seller
+# As seller (use seller's private key)
 python data_enc_util.py decrypt \
   --recipient seller \
   --private-key seller_1_sk.pem \
   --encrypted-key encrypted_aes_keys.json \
   --output decrypted_dataset.csv
 
-# As buyer
+# As buyer (use buyer's private key)
 python data_enc_util.py decrypt \
   --recipient buyer \
   --private-key buyer_0_sk.pem \
   --encrypted-key encrypted_aes_keys.json \
   --output decrypted_dataset.csv
 ```
+
+**Important**: The `--recipient` and `--private-key` must match:
+- If `--recipient buyer`, use the buyer's private key (`buyer_0_sk.pem`)
+- If `--recipient seller`, use the seller's private key (`seller_1_sk.pem`)
 
 ### 4. View Help
 ```bash
@@ -193,11 +198,76 @@ AZURE_CONNECTION_STRING=your_connection_string_here
 ### IPFS
 Ensure IPFS daemon is running on `127.0.0.1:5001` or install `ipfshttpclient`.
 
+## Troubleshooting
+
+### "Failed to decrypt AES key: Invalid curve secret key" or "An error occurred trying to decrypt the message"
+This error occurs when:
+1. You use the wrong private key for decryption
+2. The public/private key pair is mismatched (public key doesn't correspond to the private key)
+
+**Solution 1 - Verify correct private key**: Make sure the `--recipient` matches the `--private-key`:
+```bash
+# ❌ WRONG - Using seller's key for buyer
+python data_enc_util.py decrypt --recipient buyer --private-key seller_1_sk.pem ...
+
+# ✅ CORRECT - Using buyer's key for buyer
+python data_enc_util.py decrypt --recipient buyer --private-key buyer_0_sk.pem ...
+```
+
+**Solution 2 - Verify key pair matches**: Ensure the public key was derived from the private key:
+```bash
+# For Solana/Ed25519 keys, verify the key pair
+python3 -c "
+import base58
+from nacl.signing import SigningKey
+
+with open('buyer_0_sk.pem', 'r') as f:
+    sk = base58.b58decode(f.read().strip())
+with open('buyer_0_pk.pem', 'r') as f:
+    pk_stored = f.read().strip()
+
+signing_key = SigningKey(sk[:32])
+pk_derived = base58.b58encode(bytes(signing_key.verify_key)).decode()
+
+print(f'Stored PK:  {pk_stored}')
+print(f'Derived PK: {pk_derived}')
+print(f'Match: {pk_stored == pk_derived}')
+"
+```
+
+If the keys don't match, regenerate the public key from the private key or use a matching key pair.
+
+### "Failed to decrypt AES key: Decryption failed"
+This usually means:
+1. The encrypted key file is corrupted
+2. The private key doesn't match the public key used for encryption
+3. The key format is incompatible (RSA vs Solana)
+
+**Solution**: 
+- Verify the encrypted key file is not corrupted
+- Ensure you're using the correct private key that corresponds to the public key used during encryption
+- Check the key type matches (RSA keys can't decrypt Solana-encrypted data and vice versa)
+
+### "No encrypted key found for [recipient] in JSON file"
+The JSON file doesn't contain an encrypted key for the specified recipient.
+
+**Solution**: 
+- Check the encryption was done with `--encrypt-for both` or `--encrypt-for [recipient]`
+- Verify the JSON file structure contains the recipient's key
+
+### Azure/IPFS Upload Warnings
+These are informational and won't prevent encryption/decryption from working.
+
+**Solution**: 
+- For Azure: Set `AZURE_CONNECTION_STRING` in `.env` file
+- For IPFS: Start IPFS daemon with `ipfs daemon` or install `ipfshttpclient`
+
 ## Notes
 - Azure and IPFS uploads are optional and will be skipped if not configured
 - The script uses dynamic imports to avoid hard dependencies on optional packages
 - File encryption uses AES-256 in CFB mode with random IVs
 - The IV is stored as the first 16 bytes of the encrypted file
+- **Always use the correct private key**: buyer's private key for buyer, seller's private key for seller
 
 ## License
 MIT

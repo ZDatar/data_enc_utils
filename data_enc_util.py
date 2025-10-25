@@ -223,8 +223,14 @@ def load_rsa_private_key(path: str) -> Any:
             else:
                 seed = bytes(raw)
             
-            # Return the SigningKey object which can be used for decryption
-            return SigningKey(seed)
+            # Return a tuple: (SigningKey, full_64_byte_key)
+            # The full 64-byte key is needed for Curve25519 conversion
+            signing_key = SigningKey(seed)
+            if len(raw) == 64:
+                return (signing_key, bytes(raw))
+            else:
+                # If only 32 bytes, construct the full 64-byte key
+                return (signing_key, bytes(signing_key))
     
     raise ValueError(f"Unable to load private key from {path}")
 
@@ -273,38 +279,38 @@ def decrypt_aes_key_with_solana(encrypted_key: bytes, private_key: Any) -> bytes
     
     Args:
         encrypted_key: The encrypted AES key bytes
-        private_key: A nacl.signing.SigningKey object
+        private_key: A tuple of (SigningKey, full_64_byte_key) or just the 64-byte key
     
     Returns:
         The decrypted AES key
     """
     try:
         _nacl_public = importlib.import_module('nacl.public')  # type: ignore
+        from nacl.bindings import crypto_sign_ed25519_sk_to_curve25519  # type: ignore
     except Exception as e:
         raise RuntimeError('PyNaCl (nacl) is required for Solana/Ed25519 operations: ' + str(e))
     
     SealedBox = getattr(_nacl_public, 'SealedBox')  # type: ignore
-    
-    # Convert SigningKey to the encryption key format
-    # In NaCl, we need to convert the signing key to an encryption key
-    from nacl.bindings import crypto_sign_ed25519_sk_to_curve25519  # type: ignore
-    
-    # Get the raw seed from the signing key
-    seed = bytes(private_key)[:32]
-    
-    # Create a new signing key and convert to encryption key
-    _nacl_signing = importlib.import_module('nacl.signing')  # type: ignore
-    SigningKey = getattr(_nacl_signing, 'SigningKey')  # type: ignore
-    signing_key = SigningKey(seed)
-    
-    # Convert Ed25519 signing key to Curve25519 encryption key
-    encryption_key_bytes = crypto_sign_ed25519_sk_to_curve25519(bytes(signing_key))
-    
     PrivateKey = getattr(_nacl_public, 'PrivateKey')  # type: ignore
-    encryption_private_key = PrivateKey(encryption_key_bytes[:32])
     
-    box = SealedBox(encryption_private_key)  # type: ignore
-    return cast(bytes, box.decrypt(encrypted_key))  # type: ignore
+    # Extract the 64-byte key from the tuple if needed
+    if isinstance(private_key, tuple):
+        _, secret_key_bytes = private_key
+    else:
+        secret_key_bytes = bytes(private_key)
+    
+    try:
+        # Convert Ed25519 secret key (64 bytes) to Curve25519 private key (32 bytes)
+        curve25519_private_key_bytes = crypto_sign_ed25519_sk_to_curve25519(secret_key_bytes)
+        
+        # Create a Curve25519 PrivateKey for decryption
+        encryption_private_key = PrivateKey(curve25519_private_key_bytes)
+        
+        # Decrypt using SealedBox
+        box = SealedBox(encryption_private_key)  # type: ignore
+        return cast(bytes, box.decrypt(encrypted_key))  # type: ignore
+    except Exception as e:
+        raise ValueError(f"Failed to decrypt with Solana key: {e}. The key format or encrypted data may be incompatible.")
 
 
 def encrypt_aes_key_with_solana(aes_key: bytes, sol_base58_str: str) -> bytes:
@@ -316,11 +322,17 @@ def encrypt_aes_key_with_solana(aes_key: bytes, sol_base58_str: str) -> bytes:
     # Import PyNaCl dynamically; raise informative error if unavailable at runtime
     try:
         _nacl_public = importlib.import_module('nacl.public')  # type: ignore
+        from nacl.bindings import crypto_sign_ed25519_pk_to_curve25519  # type: ignore
     except Exception as e:
         raise RuntimeError('PyNaCl (nacl) is required for Solana/Ed25519 operations: ' + str(e))
+    
     SealedBox = getattr(_nacl_public, 'SealedBox')  # type: ignore
     NaClPublicKey = getattr(_nacl_public, 'PublicKey')  # type: ignore
-    box = SealedBox(NaClPublicKey(bytes(pub_raw)))  # type: ignore
+    
+    # Convert Ed25519 public key (32 bytes) to Curve25519 public key (32 bytes)
+    curve25519_public_key_bytes = crypto_sign_ed25519_pk_to_curve25519(bytes(pub_raw))
+    
+    box = SealedBox(NaClPublicKey(curve25519_public_key_bytes))  # type: ignore
     return cast(bytes, box.encrypt(aes_key))  # type: ignore
 
 
@@ -345,7 +357,7 @@ def decrypt_for_recipient(encrypted_key: bytes, private_key: Any, is_solana: boo
     
     Args:
         encrypted_key: The encrypted AES key bytes
-        private_key: The recipient's private key (RSA or Solana)
+        private_key: The recipient's private key (RSA, Solana, or tuple)
         is_solana: True if the private key is a Solana/Ed25519 key
     
     Returns:
@@ -353,33 +365,27 @@ def decrypt_for_recipient(encrypted_key: bytes, private_key: Any, is_solana: boo
     """
     # Check if this is a proxy re-encryption (starts with 'PRE:')
     if encrypted_key.startswith(b'PRE:'):
-        # Extract the components
+        # Extract the components: marker + temp_key_length + encrypted_temp + IV + encrypted_original
         data = encrypted_key[4:]  # Skip 'PRE:' marker
         temp_key_len = int.from_bytes(data[:4], 'big')
         encrypted_temp = data[4:4+temp_key_len]
-        encrypted_original = data[4+temp_key_len:]
+        iv = data[4+temp_key_len:4+temp_key_len+16]  # Extract 16-byte IV
+        encrypted_original = data[4+temp_key_len+16:]  # Rest is encrypted AES key
         
         # Decrypt the temporary key with the recipient's private key
-        if is_solana:
+        if is_solana or isinstance(private_key, tuple):
             temp_key = decrypt_aes_key_with_solana(encrypted_temp, private_key)
         else:
             temp_key = decrypt_aes_key_with_rsa(encrypted_temp, private_key)
         
-        # Decrypt the original AES key with the temporary key
-        # Note: The IV was generated randomly during encryption, so we need to extract it
-        # The encrypted_original should be: IV (16 bytes) + encrypted data
-        # But in the encryption code, a random IV is used each time, so we can't recover it
-        # We need to fix the encryption to store the IV
-        
-        # For now, we'll assume the encryption was done without storing IV properly
-        # This is a limitation of the current implementation
-        raise NotImplementedError(
-            "Proxy re-encryption decryption requires the IV to be stored with the encrypted data. "
-            "The current encryption implementation uses a random IV that is not recoverable."
-        )
+        # Decrypt the original AES key with the temporary key using the extracted IV
+        cipher = Cipher(algorithms.AES(temp_key), modes.CFB(iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        aes_key = decryptor.update(encrypted_original) + decryptor.finalize()
+        return aes_key
     else:
         # Regular encryption
-        if is_solana:
+        if is_solana or isinstance(private_key, tuple):
             return decrypt_aes_key_with_solana(encrypted_key, private_key)
         else:
             return decrypt_aes_key_with_rsa(encrypted_key, private_key)
@@ -390,7 +396,8 @@ def encrypt_for_recipient(aes_key: bytes, recipient_pk: Union[str, Any], is_re_e
     if is_re_encryption:
         temp_key = os.urandom(32)  # Generate temporary key for re-encryption
         # Encrypt the original AES key with temp key
-        cipher = Cipher(algorithms.AES(temp_key), modes.CFB(os.urandom(16)), backend=default_backend())
+        iv = os.urandom(16)  # Generate IV and store it
+        cipher = Cipher(algorithms.AES(temp_key), modes.CFB(iv), backend=default_backend())
         encryptor = cipher.encryptor()
         encrypted_original = encryptor.update(aes_key) + encryptor.finalize()
         # Now encrypt temp key for recipient
@@ -399,8 +406,8 @@ def encrypt_for_recipient(aes_key: bytes, recipient_pk: Union[str, Any], is_re_e
         else:
             _rsa = importlib.import_module('rsa')
             encrypted_temp = getattr(_rsa, 'encrypt')(temp_key, recipient_pk)  # type: ignore
-        # Combine both encrypted keys with a marker
-        return b'PRE:' + len(encrypted_temp).to_bytes(4, 'big') + encrypted_temp + encrypted_original
+        # Combine: marker + temp_key_length + encrypted_temp + IV + encrypted_original
+        return b'PRE:' + len(encrypted_temp).to_bytes(4, 'big') + encrypted_temp + iv + encrypted_original
     else:
         if isinstance(recipient_pk, str):
             return encrypt_aes_key_with_solana(aes_key, recipient_pk)
@@ -887,12 +894,19 @@ def main_decrypt(argv: Optional[List[str]] = None) -> None:
     
     # Determine if this is a Solana key
     is_solana = False
-    try:
-        _nacl_signing = importlib.import_module('nacl.signing')
-        SigningKey = getattr(_nacl_signing, 'SigningKey')
-        is_solana = isinstance(private_key, type(SigningKey(os.urandom(32))))
-    except Exception:
-        pass
+    if isinstance(private_key, tuple):
+        # It's a Solana key (SigningKey, full_key) tuple
+        is_solana = True
+    else:
+        try:
+            _nacl_signing = importlib.import_module('nacl.signing')
+            SigningKey = getattr(_nacl_signing, 'SigningKey')
+            # Check if private_key is an instance of SigningKey
+            is_solana = type(private_key).__name__ == 'SigningKey'
+        except Exception:
+            pass
+    
+    logging.info(f"Key type detected: {'Solana/Ed25519' if is_solana else 'RSA'}")
     
     # Load the encrypted AES key
     encrypted_aes_key: Optional[bytes] = None
@@ -946,6 +960,11 @@ def main_decrypt(argv: Optional[List[str]] = None) -> None:
         return
     except Exception as e:
         logging.error(f"❌ Failed to decrypt AES key: {e}")
+        logging.error(f"\nPossible causes:")
+        logging.error(f"  1. Wrong private key - Make sure you're using the {args.recipient}'s private key")
+        logging.error(f"  2. Key format mismatch - The encrypted key may have been encrypted with a different key type")
+        logging.error(f"  3. Corrupted encrypted key file")
+        logging.error(f"\nYou specified --recipient {args.recipient}, so you need the {args.recipient}'s private key.")
         return
     
     # Decrypt the file
