@@ -6,3 +6,7 @@
 .env
 test_result.txt
 *.log
+
+# Ignore decrypted and testing files
+decrypted_dataset.csv
+encrypted_aes_keys.json
