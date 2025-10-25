@@ -1,4 +1,37 @@
 #!/usr/bin/env python3
+"""
+Data Encryption/Decryption Utility
+
+This utility provides secure encryption and decryption of datasets for sharing
+between buyers and sellers using RSA or Solana/Ed25519 key formats.
+
+Features:
+    - AES-256 encryption/decryption in CFB mode
+    - RSA and Solana/Ed25519 public key encryption
+    - Proxy re-encryption for multi-party access
+    - Azure Blob Storage and IPFS upload support
+    - Comprehensive logging to console and file
+    - SHA-256 file integrity verification
+
+Usage:
+    Encryption:
+        python data_enc_util.py --encrypt-for both
+        python data_enc_util.py --encrypt-for seller
+        python data_enc_util.py --encrypt-for buyer
+    
+    Decryption:
+        python data_enc_util.py decrypt --recipient seller \\
+            --private-key seller_sk.pem \\
+            --encrypted-key encrypted_aes_keys.json \\
+            --output decrypted_dataset.csv
+    
+    Help:
+        python data_enc_util.py --help
+        python data_enc_util.py decrypt --help
+
+Author: ZDatar Team
+License: MIT
+"""
 import os
 import sys
 import base64
@@ -29,7 +62,8 @@ if TYPE_CHECKING:
     import rsa  # type: ignore
     from azure.storage.blob import BlobServiceClient  # type: ignore
 
-# === CONFIG ===
+# === CONFIGURATION ===
+# Default file paths - can be overridden via command-line arguments
 SELLER_PRIVATE_KEY_PATH = "/home/azureuser/zdatar/data_enc_utils/seller_1_sk.pem"
 SELLER_PUBLIC_KEY_PATH = "/home/azureuser/zdatar/data_enc_utils/seller_1_pk.pem"
 BUYER_PUBLIC_KEY_PATH = "/home/azureuser/zdatar/data_enc_utils/buyer_0_pk.pem"
@@ -43,7 +77,7 @@ load_dotenv()
 AZURE_CONNECTION_STRING = os.getenv("AZURE_CONNECTION_STRING")
 AZURE_CONTAINER_NAME = "zdatar-data"
 
-# Configure logging
+# Logging configuration
 LOG_FILE_PATH = "/home/azureuser/zdatar/data_enc_utils/data_enc_util.log"
 
 def setup_logging():
@@ -585,11 +619,40 @@ def main(argv: Optional[List[str]] = None) -> None:
     logging.info(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logging.info("="*80)
     
-    parser = argparse.ArgumentParser(description='Encrypt dataset and AES key for recipients')
-    parser.add_argument('--encrypt-for', choices=['buyer', 'seller', 'both'], default='both', help='Who to encrypt the AES key for')
-    parser.add_argument('--buyer-pk', default=BUYER_PUBLIC_KEY_PATH, help='Path to buyer public key (PEM or Solana base58)')
-    parser.add_argument('--seller-sk', default=SELLER_PRIVATE_KEY_PATH, help='Path to seller private key (PEM) to derive seller public key')
-    parser.add_argument('--seller-pk', default=None, help='Path to seller public key (PEM). If provided, used instead of deriving from seller-sk')
+    parser = argparse.ArgumentParser(
+        description='Encrypt dataset and AES key for recipients using RSA or Solana/Ed25519 keys',
+        epilog='Examples:\n'
+               '  python data_enc_util.py --encrypt-for seller\n'
+               '  python data_enc_util.py --encrypt-for buyer\n'
+               '  python data_enc_util.py --encrypt-for both\n'
+               '\n'
+               'For decryption, use: python data_enc_util.py decrypt --help',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        '--encrypt-for', 
+        choices=['buyer', 'seller', 'both'], 
+        default='both',
+        help='Who to encrypt the AES key for. "both" uses proxy re-encryption (default: both)'
+    )
+    parser.add_argument(
+        '--buyer-pk', 
+        default=BUYER_PUBLIC_KEY_PATH,
+        metavar='PATH',
+        help=f'Path to buyer public key in PEM or Solana base58 format (default: {BUYER_PUBLIC_KEY_PATH})'
+    )
+    parser.add_argument(
+        '--seller-sk', 
+        default=SELLER_PRIVATE_KEY_PATH,
+        metavar='PATH',
+        help=f'Path to seller private key in PEM format to derive seller public key (default: {SELLER_PRIVATE_KEY_PATH})'
+    )
+    parser.add_argument(
+        '--seller-pk', 
+        default=None,
+        metavar='PATH',
+        help='Path to seller public key (PEM or Solana base58). If provided, used instead of deriving from --seller-sk'
+    )
     args = parser.parse_args(argv)
 
     buyer_pk: Optional[Union[str, Any]] = None
@@ -765,17 +828,53 @@ def main_decrypt(argv: Optional[List[str]] = None) -> None:
     logging.info(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logging.info("="*80)
     
-    parser = argparse.ArgumentParser(description='Decrypt dataset using encrypted AES key')
-    parser.add_argument('--recipient', choices=['buyer', 'seller'], required=True, 
-                       help='Who is decrypting (buyer or seller)')
-    parser.add_argument('--private-key', required=True, 
-                       help='Path to recipient private key (PEM, Solana base58, or JSON array)')
-    parser.add_argument('--encrypted-file', default=ENCRYPTED_FILE_PATH, 
-                       help='Path to encrypted file')
-    parser.add_argument('--encrypted-key', required=True, 
-                       help='Path to encrypted AES key file or JSON file with encrypted keys')
-    parser.add_argument('--output', required=True, 
-                       help='Path to save decrypted file')
+    parser = argparse.ArgumentParser(
+        description='Decrypt dataset using encrypted AES key and recipient private key',
+        epilog='Examples:\n'
+               '  # Decrypt as seller using JSON key file\n'
+               '  python data_enc_util.py decrypt --recipient seller \\\n'
+               '    --private-key seller_sk.pem \\\n'
+               '    --encrypted-key encrypted_aes_keys.json \\\n'
+               '    --output decrypted_dataset.csv\n'
+               '\n'
+               '  # Decrypt as buyer using binary key file\n'
+               '  python data_enc_util.py decrypt --recipient buyer \\\n'
+               '    --private-key buyer_sk.pem \\\n'
+               '    --encrypted-key encrypted_aes_key_buyer.bin \\\n'
+               '    --encrypted-file test_dataset_encrypted.bin \\\n'
+               '    --output decrypted_dataset.csv',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        '--recipient', 
+        choices=['buyer', 'seller'], 
+        required=True,
+        help='Who is decrypting (buyer or seller) - required'
+    )
+    parser.add_argument(
+        '--private-key', 
+        required=True,
+        metavar='PATH',
+        help='Path to recipient private key in PEM, Solana base58, or JSON array format - required'
+    )
+    parser.add_argument(
+        '--encrypted-file', 
+        default=ENCRYPTED_FILE_PATH,
+        metavar='PATH',
+        help=f'Path to encrypted dataset file (default: {ENCRYPTED_FILE_PATH})'
+    )
+    parser.add_argument(
+        '--encrypted-key', 
+        required=True,
+        metavar='PATH',
+        help='Path to encrypted AES key file (.bin) or JSON file (.json) with encrypted keys - required'
+    )
+    parser.add_argument(
+        '--output', 
+        required=True,
+        metavar='PATH',
+        help='Path to save decrypted file - required'
+    )
     args = parser.parse_args(argv)
     
     # Load the private key
@@ -873,6 +972,23 @@ if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == 'decrypt':
         # Remove 'decrypt' from argv and call decrypt function
         main_decrypt(sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] in ['-h', '--help']:
+        # Show general help
+        print("Data Encryption/Decryption Utility")
+        print("="*80)
+        print()
+        print("MODES:")
+        print("  Encryption (default):  python data_enc_util.py [options]")
+        print("  Decryption:           python data_enc_util.py decrypt [options]")
+        print()
+        print("For mode-specific help:")
+        print("  python data_enc_util.py --help          # Encryption help")
+        print("  python data_enc_util.py decrypt --help  # Decryption help")
+        print()
+        print("="*80)
+        print()
+        # Show encryption help by default
+        main(['--help'])
     else:
         # Default to encryption mode
         main()
