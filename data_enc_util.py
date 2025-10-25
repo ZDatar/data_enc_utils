@@ -93,6 +93,108 @@ def encrypt_file_with_aes(input_path: str, output_path: str, aes_key: bytes) -> 
     return iv
 
 
+def decrypt_file_with_aes(input_path: str, output_path: str, aes_key: bytes) -> None:
+    """Decrypt a file that was encrypted with encrypt_file_with_aes.
+    
+    The encrypted file has the IV as the first 16 bytes, followed by the encrypted data.
+    """
+    with open(input_path, 'rb') as f_in:
+        iv = f_in.read(16)
+        if len(iv) != 16:
+            raise ValueError(f"Invalid encrypted file: expected 16-byte IV, got {len(iv)} bytes")
+        
+        cipher = Cipher(algorithms.AES(aes_key), modes.CFB(iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        
+        with open(output_path, 'wb') as f_out:
+            while chunk := f_in.read(4096):
+                f_out.write(decryptor.update(chunk))
+            f_out.write(decryptor.finalize())
+    
+    logging.info(f"✅ Decrypted file saved to {output_path}")
+
+
+def load_rsa_private_key(path: str) -> Any:
+    """Load an RSA private key from a file.
+    
+    Supports multiple formats:
+    - PKCS#1 PEM format (rsa library)
+    - PKCS#8 PEM format (cryptography library)
+    - Solana/Ed25519 keys (base58 or JSON array)
+    """
+    data = open(path, 'rb').read()
+    
+    # Try rsa.PrivateKey.load_pkcs1
+    try:
+        _rsa = importlib.import_module('rsa')
+        return getattr(_rsa.PrivateKey, 'load_pkcs1')(data)  # type: ignore
+    except Exception:
+        pass
+    
+    # Try to load as PEM RSA private key using cryptography
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa as crypto_rsa
+    try:
+        priv = serialization.load_pem_private_key(data, password=None, backend=default_backend())
+        if isinstance(priv, crypto_rsa.RSAPrivateKey):
+            # Convert to rsa library format for consistency
+            numbers = priv.private_numbers()
+            _rsa = importlib.import_module('rsa')
+            return _rsa.PrivateKey(
+                numbers.public_numbers.n,
+                numbers.public_numbers.e,
+                numbers.d,
+                numbers.p,
+                numbers.q
+            )  # type: ignore
+    except Exception:
+        pass
+    
+    # Try Solana/Ed25519 format (base58 or JSON array)
+    try:
+        text = data.decode('utf-8').strip()
+    except Exception:
+        text = ''
+    
+    if text:
+        raw: bytes = b''
+        # try base58
+        try:
+            _base58 = importlib.import_module('base58')  # type: ignore
+            decoded = getattr(_base58, 'b58decode')(text)  # type: ignore
+            raw = decoded  # type: ignore
+        except Exception:
+            pass
+        
+        # try JSON array of ints
+        if not raw:
+            try:
+                arr = json.loads(text)
+                if isinstance(arr, list) and all(isinstance(x, int) for x in arr):
+                    raw = bytes(cast(List[int], arr))
+            except Exception:
+                pass
+        
+        # If we have 32 or 64 bytes, treat as Ed25519 secret
+        if isinstance(raw, (bytes, bytearray)) and len(raw) in (32, 64):
+            try:
+                _nacl_signing = importlib.import_module('nacl.signing')  # type: ignore
+            except Exception as e:
+                raise RuntimeError("PyNaCl is required to load Ed25519 private keys: " + str(e))
+            
+            SigningKey = getattr(_nacl_signing, 'SigningKey')  # type: ignore
+            
+            if len(raw) == 64:
+                seed = bytes(raw[:32])
+            else:
+                seed = bytes(raw)
+            
+            # Return the SigningKey object which can be used for decryption
+            return SigningKey(seed)
+    
+    raise ValueError(f"Unable to load private key from {path}")
+
+
 def load_rsa_public_key(path: str) -> Any:
     data = open(path, 'rb').read()
     try:
@@ -132,6 +234,45 @@ def is_solana_base58_key(data: bytes) -> bool:
     return False
 
 
+def decrypt_aes_key_with_solana(encrypted_key: bytes, private_key: Any) -> bytes:
+    """Decrypt an AES key using a Solana/Ed25519 private key.
+    
+    Args:
+        encrypted_key: The encrypted AES key bytes
+        private_key: A nacl.signing.SigningKey object
+    
+    Returns:
+        The decrypted AES key
+    """
+    try:
+        _nacl_public = importlib.import_module('nacl.public')  # type: ignore
+    except Exception as e:
+        raise RuntimeError('PyNaCl (nacl) is required for Solana/Ed25519 operations: ' + str(e))
+    
+    SealedBox = getattr(_nacl_public, 'SealedBox')  # type: ignore
+    
+    # Convert SigningKey to the encryption key format
+    # In NaCl, we need to convert the signing key to an encryption key
+    from nacl.bindings import crypto_sign_ed25519_sk_to_curve25519  # type: ignore
+    
+    # Get the raw seed from the signing key
+    seed = bytes(private_key)[:32]
+    
+    # Create a new signing key and convert to encryption key
+    _nacl_signing = importlib.import_module('nacl.signing')  # type: ignore
+    SigningKey = getattr(_nacl_signing, 'SigningKey')  # type: ignore
+    signing_key = SigningKey(seed)
+    
+    # Convert Ed25519 signing key to Curve25519 encryption key
+    encryption_key_bytes = crypto_sign_ed25519_sk_to_curve25519(bytes(signing_key))
+    
+    PrivateKey = getattr(_nacl_public, 'PrivateKey')  # type: ignore
+    encryption_private_key = PrivateKey(encryption_key_bytes[:32])
+    
+    box = SealedBox(encryption_private_key)  # type: ignore
+    return cast(bytes, box.decrypt(encrypted_key))  # type: ignore
+
+
 def encrypt_aes_key_with_solana(aes_key: bytes, sol_base58_str: str) -> bytes:
     _base58 = importlib.import_module('base58')  # type: ignore
     pub_raw = getattr(_base58, 'b58decode')(sol_base58_str)  # type: ignore
@@ -147,6 +288,67 @@ def encrypt_aes_key_with_solana(aes_key: bytes, sol_base58_str: str) -> bytes:
     NaClPublicKey = getattr(_nacl_public, 'PublicKey')  # type: ignore
     box = SealedBox(NaClPublicKey(bytes(pub_raw)))  # type: ignore
     return cast(bytes, box.encrypt(aes_key))  # type: ignore
+
+
+def decrypt_aes_key_with_rsa(encrypted_key: bytes, private_key: Any) -> bytes:
+    """Decrypt an AES key using an RSA private key.
+    
+    Args:
+        encrypted_key: The encrypted AES key bytes
+        private_key: An rsa.PrivateKey object
+    
+    Returns:
+        The decrypted AES key
+    """
+    _rsa = importlib.import_module('rsa')
+    return cast(bytes, getattr(_rsa, 'decrypt')(encrypted_key, private_key))  # type: ignore
+
+
+def decrypt_for_recipient(encrypted_key: bytes, private_key: Any, is_solana: bool = False) -> bytes:
+    """Decrypt an AES key that was encrypted for a recipient.
+    
+    Handles both regular encryption and proxy re-encryption.
+    
+    Args:
+        encrypted_key: The encrypted AES key bytes
+        private_key: The recipient's private key (RSA or Solana)
+        is_solana: True if the private key is a Solana/Ed25519 key
+    
+    Returns:
+        The decrypted AES key
+    """
+    # Check if this is a proxy re-encryption (starts with 'PRE:')
+    if encrypted_key.startswith(b'PRE:'):
+        # Extract the components
+        data = encrypted_key[4:]  # Skip 'PRE:' marker
+        temp_key_len = int.from_bytes(data[:4], 'big')
+        encrypted_temp = data[4:4+temp_key_len]
+        encrypted_original = data[4+temp_key_len:]
+        
+        # Decrypt the temporary key with the recipient's private key
+        if is_solana:
+            temp_key = decrypt_aes_key_with_solana(encrypted_temp, private_key)
+        else:
+            temp_key = decrypt_aes_key_with_rsa(encrypted_temp, private_key)
+        
+        # Decrypt the original AES key with the temporary key
+        # Note: The IV was generated randomly during encryption, so we need to extract it
+        # The encrypted_original should be: IV (16 bytes) + encrypted data
+        # But in the encryption code, a random IV is used each time, so we can't recover it
+        # We need to fix the encryption to store the IV
+        
+        # For now, we'll assume the encryption was done without storing IV properly
+        # This is a limitation of the current implementation
+        raise NotImplementedError(
+            "Proxy re-encryption decryption requires the IV to be stored with the encrypted data. "
+            "The current encryption implementation uses a random IV that is not recoverable."
+        )
+    else:
+        # Regular encryption
+        if is_solana:
+            return decrypt_aes_key_with_solana(encrypted_key, private_key)
+        else:
+            return decrypt_aes_key_with_rsa(encrypted_key, private_key)
 
 
 def encrypt_for_recipient(aes_key: bytes, recipient_pk: Union[str, Any], is_re_encryption: bool = False) -> bytes:
@@ -547,5 +749,130 @@ def main(argv: Optional[List[str]] = None) -> None:
     logging.info(make_encrypted_keys_json(out_paths))
 
 
+def main_decrypt(argv: Optional[List[str]] = None) -> None:
+    """Main function for decrypting files."""
+    # Setup logging first
+    setup_logging()
+    
+    # Log the command line invocation
+    if argv is None:
+        cmd_line = ' '.join(sys.argv)
+    else:
+        cmd_line = f"python {sys.argv[0]} {' '.join(argv)}"
+    
+    logging.info("="*80)
+    logging.info(f"Script invoked: {cmd_line}")
+    logging.info(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logging.info("="*80)
+    
+    parser = argparse.ArgumentParser(description='Decrypt dataset using encrypted AES key')
+    parser.add_argument('--recipient', choices=['buyer', 'seller'], required=True, 
+                       help='Who is decrypting (buyer or seller)')
+    parser.add_argument('--private-key', required=True, 
+                       help='Path to recipient private key (PEM, Solana base58, or JSON array)')
+    parser.add_argument('--encrypted-file', default=ENCRYPTED_FILE_PATH, 
+                       help='Path to encrypted file')
+    parser.add_argument('--encrypted-key', required=True, 
+                       help='Path to encrypted AES key file or JSON file with encrypted keys')
+    parser.add_argument('--output', required=True, 
+                       help='Path to save decrypted file')
+    args = parser.parse_args(argv)
+    
+    # Load the private key
+    try:
+        private_key = load_rsa_private_key(args.private_key)
+        logging.info(f"✅ Loaded private key from {args.private_key}")
+    except Exception as e:
+        logging.error(f"❌ Failed to load private key from {args.private_key}: {e}")
+        return
+    
+    # Determine if this is a Solana key
+    is_solana = False
+    try:
+        _nacl_signing = importlib.import_module('nacl.signing')
+        SigningKey = getattr(_nacl_signing, 'SigningKey')
+        is_solana = isinstance(private_key, type(SigningKey(os.urandom(32))))
+    except Exception:
+        pass
+    
+    # Load the encrypted AES key
+    encrypted_aes_key: Optional[bytes] = None
+    
+    # Check if the encrypted key file is a JSON file
+    if args.encrypted_key.endswith('.json'):
+        try:
+            with open(args.encrypted_key, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # Extract the encrypted key for the specified recipient
+            if 'recipients' in data and args.recipient in data['recipients']:
+                recipient_data = data['recipients'][args.recipient]
+                if 'error' in recipient_data:
+                    logging.error(f"❌ Encrypted key for {args.recipient} has error: {recipient_data['error']}")
+                    return
+                
+                encrypted_key_b64 = recipient_data.get('encryptedKey')
+                if encrypted_key_b64:
+                    encrypted_aes_key = base64.b64decode(encrypted_key_b64)
+                    logging.info(f"✅ Loaded encrypted AES key for {args.recipient} from JSON")
+                else:
+                    logging.error(f"❌ No encryptedKey field found for {args.recipient}")
+                    return
+            else:
+                logging.error(f"❌ No encrypted key found for {args.recipient} in JSON file")
+                return
+        except Exception as e:
+            logging.error(f"❌ Failed to load encrypted key from JSON {args.encrypted_key}: {e}")
+            return
+    else:
+        # Load as binary file
+        try:
+            with open(args.encrypted_key, 'rb') as f:
+                encrypted_aes_key = f.read()
+            logging.info(f"✅ Loaded encrypted AES key from {args.encrypted_key}")
+        except Exception as e:
+            logging.error(f"❌ Failed to load encrypted key from {args.encrypted_key}: {e}")
+            return
+    
+    if encrypted_aes_key is None:
+        logging.error("❌ Failed to load encrypted AES key")
+        return
+    
+    # Decrypt the AES key
+    try:
+        aes_key = decrypt_for_recipient(encrypted_aes_key, private_key, is_solana)
+        logging.info(f"✅ Decrypted AES key successfully")
+    except NotImplementedError as e:
+        logging.error(f"❌ {e}")
+        return
+    except Exception as e:
+        logging.error(f"❌ Failed to decrypt AES key: {e}")
+        return
+    
+    # Decrypt the file
+    try:
+        decrypt_file_with_aes(args.encrypted_file, args.output, aes_key)
+        logging.info(f"✅ Successfully decrypted file to {args.output}")
+    except Exception as e:
+        logging.error(f"❌ Failed to decrypt file: {e}")
+        return
+    
+    # Compute and display SHA-256 of decrypted file
+    file_hash = compute_file_sha256(args.output)
+    if file_hash:
+        logging.info(f"• Decrypted file SHA-256: {file_hash}")
+    
+    logging.info("\n🔓 Decryption Summary:")
+    logging.info(f"• Encrypted file: {args.encrypted_file}")
+    logging.info(f"• Decrypted file: {args.output}")
+    logging.info(f"• Recipient: {args.recipient}")
+
+
 if __name__ == '__main__':
-    main()
+    # Check if the first argument is 'decrypt' to determine mode
+    if len(sys.argv) > 1 and sys.argv[1] == 'decrypt':
+        # Remove 'decrypt' from argv and call decrypt function
+        main_decrypt(sys.argv[2:])
+    else:
+        # Default to encryption mode
+        main()
