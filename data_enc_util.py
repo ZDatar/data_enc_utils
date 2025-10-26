@@ -40,13 +40,18 @@ import json
 import mimetypes
 import argparse
 import logging
+import secrets
 from datetime import datetime
-from typing import Any, Dict, Optional, Union, List, Mapping, Sequence, cast
+from typing import Any, Dict, Optional, Union, List, Mapping, Sequence, Tuple, cast
 
 import importlib
 import requests
 from dotenv import load_dotenv
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 from typing import TYPE_CHECKING
 
@@ -78,6 +83,9 @@ ENCRYPTED_FILE_PATH = "/home/azureuser/zdatar/data_enc_utils/test_dataset_encryp
 ENCRYPTED_AES_KEY_BUYER_PATH = "/home/azureuser/zdatar/data_enc_utils/encrypted_aes_key_buyer.bin"
 ENCRYPTED_AES_KEY_SELLER_PATH = "/home/azureuser/zdatar/data_enc_utils/encrypted_aes_key_seller.bin"
 ENCRYPTED_AES_KEYS_COMBINED_PATH = "/home/azureuser/zdatar/data_enc_utils/encrypted_aes_keys.json"
+ENCRYPTED_AES_KEY_BUYER_ENVELOPE_PATH = "/home/azureuser/zdatar/data_enc_utils/encrypted_aes_key_buyer.json"
+ENCRYPTED_AES_KEY_SELLER_ENVELOPE_PATH = "/home/azureuser/zdatar/data_enc_utils/encrypted_aes_key_seller.json"
+MULTI_RECIPIENT_INFO = b"ZDatar AES key envelope v1"
 
 load_dotenv()
 AZURE_CONNECTION_STRING = os.getenv("AZURE_CONNECTION_STRING")
@@ -152,6 +160,252 @@ def decrypt_file_with_aes(input_path: str, output_path: str, aes_key: bytes) -> 
             f_out.write(decryptor.finalize())
     
     logging.info(f"✅ Decrypted file saved to {output_path}")
+
+
+# ---------- Multi-recipient Hybrid Encryption Helpers ----------
+
+def b64e(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def b64d(data_b64: str) -> bytes:
+    return base64.b64decode(data_b64.encode("ascii"))
+
+
+def hkdf_sha256(ikm: bytes, salt: Optional[bytes], info: bytes, length: int = 32) -> bytes:
+    return HKDF(algorithm=hashes.SHA256(), length=length, salt=salt, info=info).derive(ikm)
+
+
+def load_x25519_sk(sk_bytes: bytes) -> X25519PrivateKey:
+    return X25519PrivateKey.from_private_bytes(sk_bytes)
+
+
+def load_x25519_pk(pk_bytes: bytes) -> X25519PublicKey:
+    return X25519PublicKey.from_public_bytes(pk_bytes)
+
+
+def solana_to_x25519_keypair(solana_privkey_bytes: bytes) -> Tuple[bytes, bytes]:
+    """
+    Convert a 32-byte seed or 64-byte Solana (Ed25519) private key to an X25519 key pair.
+    Returns a tuple of (x25519_private_key_bytes, x25519_public_key_bytes).
+    """
+    if len(solana_privkey_bytes) == 64:
+        seed = solana_privkey_bytes[:32]
+    elif len(solana_privkey_bytes) == 32:
+        seed = solana_privkey_bytes
+    else:
+        raise ValueError("Solana private key must be 32 or 64 bytes")
+
+    _nacl_signing = importlib.import_module('nacl.signing')  # type: ignore
+    SigningKey = getattr(_nacl_signing, 'SigningKey')  # type: ignore
+    ed_sk = SigningKey(seed)
+    ed_pk = ed_sk.verify_key
+    x_sk = ed_sk.to_curve25519_private_key()
+    x_pk = ed_pk.to_curve25519_public_key()
+    return cast(bytes, x_sk.encode()), cast(bytes, x_pk.encode())
+
+
+def solana_pub_to_x25519_pub(solana_pubkey_bytes: bytes) -> bytes:
+    _nacl_signing = importlib.import_module('nacl.signing')  # type: ignore
+    VerifyKey = getattr(_nacl_signing, 'VerifyKey')  # type: ignore
+    ed_pk = VerifyKey(solana_pubkey_bytes)
+    x_pk = ed_pk.to_curve25519_public_key()
+    return cast(bytes, x_pk.encode())
+
+
+def solana_private_to_x25519_private_bytes(private_key: Any) -> bytes:
+    """
+    Accepts the Solana private key formats returned by load_rsa_private_key and
+    converts them into raw X25519 private key bytes.
+    """
+    candidate: Optional[bytes] = None
+
+    if isinstance(private_key, tuple) and len(private_key) >= 2:
+        maybe_bytes = private_key[1]
+        if isinstance(maybe_bytes, (bytes, bytearray, memoryview)):
+            candidate = bytes(maybe_bytes)
+    elif isinstance(private_key, (bytes, bytearray, memoryview)):
+        candidate = bytes(private_key)
+    else:
+        try:
+            _nacl_signing = importlib.import_module('nacl.signing')  # type: ignore
+            SigningKey = getattr(_nacl_signing, 'SigningKey')  # type: ignore
+            if isinstance(private_key, SigningKey):
+                candidate = bytes(private_key)
+        except Exception:
+            candidate = None
+
+    if candidate is None:
+        raise ValueError("Unsupported Solana private key format for X25519 conversion")
+
+    return solana_to_x25519_keypair(candidate)[0]
+
+
+def encrypt_multi(
+    message: bytes,
+    recipients: Sequence[Mapping[str, Union[str, bytes]]],
+    *,
+    aead_alg: str = "AESGCM-256",
+    kem: str = "X25519-HKDF-SHA256",
+    info: bytes = MULTI_RECIPIENT_INFO,
+    kid_field: str = "kid",
+    aad_extra: Optional[bytes] = None,
+) -> str:
+    """
+    Multi-recipient hybrid encryption: encrypt `message` once and wrap the data key
+    separately for each recipient using X25519 + HKDF + AES-GCM.
+    """
+    if not recipients:
+        raise ValueError("At least one recipient is required for multi-recipient encryption")
+
+    data_key = secrets.token_bytes(32)  # 256-bit AES key
+    nonce_data = secrets.token_bytes(12)  # AES-GCM nonce
+
+    recipients_entries: List[Dict[str, str]] = []
+    for recipient in recipients:
+        kid_value = recipient.get(kid_field)
+        if not isinstance(kid_value, str):
+            raise TypeError(f"Recipient field '{kid_field}' must be a string, got {type(kid_value)!r}")
+        pk_value = recipient.get("pk")
+        if not isinstance(pk_value, (bytes, bytearray)):
+            raise TypeError("Recipient 'pk' must be bytes")
+
+        kid = kid_value
+        pk_r = load_x25519_pk(bytes(pk_value))
+        eph_sk = X25519PrivateKey.generate()
+        eph_pk = eph_sk.public_key()
+
+        shared = eph_sk.exchange(pk_r)
+        context = (
+            b"kw-context|" + info +
+            b"|aead=" + aead_alg.encode() +
+            b"|kem=" + kem.encode() +
+            b"|kid=" + kid.encode()
+        )
+        wrap_key = hkdf_sha256(shared, salt=None, info=context, length=32)
+
+        aes_kw = AESGCM(wrap_key)
+        nonce_kw = secrets.token_bytes(12)
+        aad_kw = b"kw-aad|" + kid.encode() + b"|" + eph_pk.public_bytes_raw()
+        wrapped = aes_kw.encrypt(nonce_kw, data_key, aad_kw)
+
+        recipients_entries.append({
+            kid_field: kid,
+            "kem": kem,
+            "eph_pub": b64e(eph_pk.public_bytes_raw()),
+            "nonce": b64e(nonce_kw),
+            "kw": b64e(wrapped),
+        })
+
+    header: Dict[str, Union[str, List[Dict[str, str]]]] = {
+        "ver": "1",
+        "aead": aead_alg,
+        "nonce": b64e(nonce_data),
+        "recipients": recipients_entries,
+    }
+    if aad_extra:
+        header["aad_ext"] = b64e(aad_extra)
+
+    aad_header = json.dumps(header, separators=(",", ":"), sort_keys=True).encode()
+    ciphertext = AESGCM(data_key).encrypt(nonce_data, message, aad_header)
+    header["ciphertext"] = b64e(ciphertext)
+    return json.dumps(header, separators=(",", ":"), sort_keys=True)
+
+
+def decrypt_multi_envelope(
+    envelope_json: str,
+    sk_bytes: bytes,
+    *,
+    info: bytes = MULTI_RECIPIENT_INFO,
+    expected_kid: Optional[str] = None,
+) -> bytes:
+    """
+    Attempt to decrypt the multi-recipient envelope using the provided X25519 private key.
+    """
+    envelope = cast(Dict[str, Any], json.loads(envelope_json))
+    nonce_data = b64d(cast(str, envelope["nonce"]))
+    ciphertext = b64d(cast(str, envelope["ciphertext"]))
+
+    recipients_list = cast(Sequence[Dict[str, Any]], envelope["recipients"])
+    if expected_kid:
+        ordered = [r for r in recipients_list if r.get("kid") == expected_kid]
+        if not ordered:
+            ordered = list(recipients_list)
+    else:
+        ordered = list(recipients_list)
+
+    header_copy: Dict[str, Any] = dict(envelope)
+    del header_copy["ciphertext"]
+    aad_header = json.dumps(header_copy, separators=(",", ":"), sort_keys=True).encode()
+
+    sk = load_x25519_sk(sk_bytes)
+    last_err: Optional[Exception] = None
+    for entry in ordered:
+        try:
+            eph_pub = load_x25519_pk(b64d(cast(str, entry["eph_pub"])))
+            nonce_kw = b64d(cast(str, entry["nonce"]))
+            wrapped = b64d(cast(str, entry["kw"]))
+            kid = cast(str, entry.get("kid", ""))
+
+            shared = sk.exchange(eph_pub)
+            context = (
+                b"kw-context|" + info +
+                b"|aead=" + cast(str, envelope["aead"]).encode() +
+                b"|kem=" + cast(str, entry.get("kem", "X25519-HKDF-SHA256")).encode() +
+                b"|kid=" + kid.encode()
+            )
+            wrap_key = hkdf_sha256(shared, salt=None, info=context, length=32)
+            aad_kw = b"kw-aad|" + kid.encode() + b"|" + eph_pub.public_bytes_raw()
+            data_key = AESGCM(wrap_key).decrypt(nonce_kw, wrapped, aad_kw)
+            return AESGCM(data_key).decrypt(nonce_data, ciphertext, aad_header)
+        except Exception as exc:
+            last_err = exc
+            continue
+
+    raise Exception(f"Unable to decrypt envelope for provided key. Last error: {last_err!r}")
+
+
+def build_solana_recipient_entries(label_to_public: Mapping[str, Union[str, bytes]]) -> List[Dict[str, Union[str, bytes]]]:
+    """
+    Convert a mapping of label -> Solana public key (base58 string or raw bytes)
+    into recipient entries accepted by encrypt_multi.
+    """
+    _base58 = None
+    try:
+        _base58 = importlib.import_module('base58')  # type: ignore
+    except Exception:
+        # Only raise if we actually need to decode base58 strings below
+        _base58 = None
+
+    entries: List[Dict[str, Union[str, bytes]]] = []
+    for label, value in label_to_public.items():
+        if isinstance(value, str):
+            if _base58 is None:
+                raise RuntimeError("base58 package is required for Solana recipients")
+            decoded = getattr(_base58, 'b58decode')(value)  # type: ignore
+            if not isinstance(decoded, (bytes, bytearray)):
+                raise ValueError(f"Decoded Solana public key for {label} is not bytes")
+            raw_pub = bytes(decoded)
+        elif isinstance(value, (bytes, bytearray, memoryview)):
+            raw_pub = bytes(value)
+        else:
+            raise TypeError(f"Unsupported Solana public key type for {label}: {type(value)!r}")
+
+        if len(raw_pub) != 32:
+            raise ValueError(f"Solana public key for {label} must be 32 bytes, got {len(raw_pub)} bytes")
+
+        entries.append({"kid": label, "pk": solana_pub_to_x25519_pub(raw_pub)})
+    return entries
+
+
+def is_multi_recipient_envelope(obj: Any) -> bool:
+    return (
+        isinstance(obj, Mapping)
+        and "ciphertext" in obj
+        and "recipients" in obj
+        and "nonce" in obj
+        and "aead" in obj
+    )
 
 
 def load_rsa_private_key(path: str) -> Any:
@@ -767,60 +1021,107 @@ def main(argv: Optional[List[str]] = None) -> None:
     aes_key = generate_aes_key()
     encrypt_file_with_aes(DATASET_PATH, ENCRYPTED_FILE_PATH, aes_key)
 
-    out_paths: Dict[str, str] = {}
-    encrypted_items: Dict[str, bytes] = {}
-
-    # Buyer
+    requested_labels: List[str] = []
     if args.encrypt_for in ('buyer', 'both'):
-        if buyer_pk is None:
-            logging.error("❌ Buyer public key not loaded; cannot encrypt AES key for buyer")
-            return
-        c_buyer = encrypt_for_recipient(aes_key, buyer_pk)
-        if args.encrypt_for == 'both':
-            encrypted_items['buyer'] = c_buyer
-        else:
-            with open(ENCRYPTED_AES_KEY_BUYER_PATH, 'wb') as f:
-                f.write(c_buyer)
-            out_paths['buyer'] = ENCRYPTED_AES_KEY_BUYER_PATH
-
-    # Seller
+        requested_labels.append('buyer')
     if args.encrypt_for in ('seller', 'both'):
-        if seller_pk is None:
-            logging.error("❌ Seller public key not available; cannot encrypt AES key for seller")
+        requested_labels.append('seller')
+
+    solana_pk_map: Dict[str, Union[str, bytes]] = {}
+    rsa_pk_map: Dict[str, Any] = {}
+    for label in requested_labels:
+        pk_value = buyer_pk if label == 'buyer' else seller_pk
+        if pk_value is None:
+            logging.error(f"❌ {label.capitalize()} public key not available; cannot encrypt AES key")
             return
-        c_seller = encrypt_for_recipient(aes_key, seller_pk)
-        if args.encrypt_for == 'both':
-            encrypted_items['seller'] = c_seller
+        if isinstance(pk_value, str):
+            solana_pk_map[label] = pk_value
+        elif isinstance(pk_value, (bytes, bytearray, memoryview)) and len(pk_value) == 32:
+            solana_pk_map[label] = bytes(pk_value)
         else:
-            with open(ENCRYPTED_AES_KEY_SELLER_PATH, 'wb') as f:
-                f.write(c_seller)
-            out_paths['seller'] = ENCRYPTED_AES_KEY_SELLER_PATH
+            rsa_pk_map[label] = pk_value
 
-    # If both recipients are requested, we'll use proxy re-encryption approach to allow
-    # both parties to decrypt with their own keys
-    combined_json: Optional[str] = None
-    if args.encrypt_for == 'both':
-        if buyer_pk is None or seller_pk is None:
-            logging.error("❌ Both buyer and seller public keys required for proxy re-encryption")
-            return
+    out_paths: Dict[str, str] = {}
+    aad_context = os.path.basename(ENCRYPTED_FILE_PATH).encode('utf-8')
 
-        # First encrypt for the seller (primary recipient)
-        c_seller = encrypt_for_recipient(aes_key, seller_pk)
-        
-        # Then create a re-encryption for the buyer that allows decryption with buyer's key
-        c_buyer = encrypt_for_recipient(aes_key, buyer_pk, is_re_encryption=True)
-        
-        encrypted_items['seller'] = c_seller
-        encrypted_items['buyer'] = c_buyer
-        
-        combined_json = make_encrypted_keys_json_from_bytes(encrypted_items)
+    # Solana recipients via multi-recipient hybrid encryption
+    if solana_pk_map:
         try:
-            with open(ENCRYPTED_AES_KEYS_COMBINED_PATH, 'w', encoding='utf-8') as f:
-                f.write(combined_json)
-        except Exception as e:
-            logging.error(f"❌ Failed to write combined encrypted keys to {ENCRYPTED_AES_KEYS_COMBINED_PATH}: {e}")
+            if len(solana_pk_map) > 1:
+                solana_entries = build_solana_recipient_entries(solana_pk_map)
+                solana_envelope = encrypt_multi(
+                    aes_key,
+                    solana_entries,
+                    info=MULTI_RECIPIENT_INFO,
+                    aad_extra=aad_context,
+                )
+                with open(ENCRYPTED_AES_KEYS_COMBINED_PATH, 'w', encoding='utf-8') as f:
+                    f.write(solana_envelope)
+                out_paths['solana_multi_recipient'] = ENCRYPTED_AES_KEYS_COMBINED_PATH
+                logging.info(
+                    f"✅ Encrypted AES key for Solana recipients using multi-recipient envelope: {ENCRYPTED_AES_KEYS_COMBINED_PATH}"
+                )
+            else:
+                label, value = next(iter(solana_pk_map.items()))
+                solana_entry = build_solana_recipient_entries({label: value})
+                solana_envelope = encrypt_multi(
+                    aes_key,
+                    solana_entry,
+                    info=MULTI_RECIPIENT_INFO,
+                    aad_extra=aad_context,
+                )
+                target_path = (
+                    ENCRYPTED_AES_KEY_BUYER_ENVELOPE_PATH
+                    if label == 'buyer'
+                    else ENCRYPTED_AES_KEY_SELLER_ENVELOPE_PATH
+                )
+                with open(target_path, 'w', encoding='utf-8') as f:
+                    f.write(solana_envelope)
+                out_paths[f"{label}_solana_envelope"] = target_path
+                logging.info(
+                    f"✅ Encrypted AES key for {label} using Solana multi-recipient envelope: {target_path}"
+                )
+        except Exception as exc:
+            logging.error(f"❌ Failed to create multi-recipient envelope for Solana recipients: {exc}")
             return
-        out_paths['both'] = ENCRYPTED_AES_KEYS_COMBINED_PATH
+
+    # RSA recipients (legacy path)
+    rsa_labels = set(rsa_pk_map.keys())
+    if rsa_labels:
+        if rsa_labels == {'buyer', 'seller'} and args.encrypt_for == 'both' and not solana_pk_map:
+            try:
+                seller_cipher = encrypt_for_recipient(aes_key, rsa_pk_map['seller'])
+                buyer_cipher = encrypt_for_recipient(aes_key, rsa_pk_map['buyer'], is_re_encryption=True)
+            except Exception as exc:
+                logging.error(f"❌ Failed to encrypt AES key for RSA recipients: {exc}")
+                return
+            combined_json = make_encrypted_keys_json_from_bytes({'seller': seller_cipher, 'buyer': buyer_cipher})
+            try:
+                with open(ENCRYPTED_AES_KEYS_COMBINED_PATH, 'w', encoding='utf-8') as f:
+                    f.write(combined_json)
+            except Exception as exc:
+                logging.error(f"❌ Failed to write combined RSA encrypted keys to {ENCRYPTED_AES_KEYS_COMBINED_PATH}: {exc}")
+                return
+            out_paths['rsa_combined'] = ENCRYPTED_AES_KEYS_COMBINED_PATH
+            logging.info(
+                f"✅ Encrypted AES key for buyer and seller using RSA proxy re-encryption: {ENCRYPTED_AES_KEYS_COMBINED_PATH}"
+            )
+        else:
+            for label, pk_value in rsa_pk_map.items():
+                try:
+                    cipher = encrypt_for_recipient(aes_key, pk_value)
+                except Exception as exc:
+                    logging.error(f"❌ Failed to encrypt AES key for {label}: {exc}")
+                    return
+                target_path = ENCRYPTED_AES_KEY_BUYER_PATH if label == 'buyer' else ENCRYPTED_AES_KEY_SELLER_PATH
+                try:
+                    with open(target_path, 'wb') as f:
+                        f.write(cipher)
+                except Exception as exc:
+                    logging.error(f"❌ Failed to write encrypted key for {label} to {target_path}: {exc}")
+                    return
+                out_paths[f"{label}_rsa"] = target_path
+                logging.info(f"✅ Encrypted AES key for {label} using RSA and saved to {target_path}")
 
     ipfs_cid = upload_to_ipfs(ENCRYPTED_FILE_PATH)
     azure_url = upload_to_azure(ENCRYPTED_FILE_PATH)
@@ -929,32 +1230,44 @@ def main_decrypt(argv: Optional[List[str]] = None) -> None:
     
     # Load the encrypted AES key
     encrypted_aes_key: Optional[bytes] = None
+    aes_key: Optional[bytes] = None
     
     # Check if the encrypted key file is a JSON file
     if args.encrypted_key.endswith('.json'):
         try:
             with open(args.encrypted_key, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            # Extract the encrypted key for the specified recipient
-            if 'recipients' in data and args.recipient in data['recipients']:
-                recipient_data = data['recipients'][args.recipient]
-                if 'error' in recipient_data:
-                    logging.error(f"❌ Encrypted key for {args.recipient} has error: {recipient_data['error']}")
-                    return
-                
-                encrypted_key_b64 = recipient_data.get('encryptedKey')
-                if encrypted_key_b64:
-                    encrypted_aes_key = base64.b64decode(encrypted_key_b64)
-                    logging.info(f"✅ Loaded encrypted AES key for {args.recipient} from JSON")
-                else:
-                    logging.error(f"❌ No encryptedKey field found for {args.recipient}")
-                    return
-            else:
-                logging.error(f"❌ No encrypted key found for {args.recipient} in JSON file")
-                return
+                raw_json = f.read()
+            data = json.loads(raw_json)
         except Exception as e:
             logging.error(f"❌ Failed to load encrypted key from JSON {args.encrypted_key}: {e}")
+            return
+        
+        if is_multi_recipient_envelope(data):
+            if not is_solana:
+                logging.error("❌ Multi-recipient envelope requires a Solana/Ed25519 private key")
+                return
+            try:
+                x25519_sk = solana_private_to_x25519_private_bytes(private_key)
+                aes_key = decrypt_multi_envelope(raw_json, x25519_sk, expected_kid=args.recipient)
+                logging.info("✅ Decrypted AES key from multi-recipient envelope")
+            except Exception as e:
+                logging.error(f"❌ Failed to decrypt multi-recipient envelope: {e}")
+                return
+        elif 'recipients' in data and args.recipient in data['recipients']:
+            recipient_data = data['recipients'][args.recipient]
+            if 'error' in recipient_data:
+                logging.error(f"❌ Encrypted key for {args.recipient} has error: {recipient_data['error']}")
+                return
+
+            encrypted_key_b64 = recipient_data.get('encryptedKey')
+            if encrypted_key_b64:
+                encrypted_aes_key = base64.b64decode(encrypted_key_b64)
+                logging.info(f"✅ Loaded encrypted AES key for {args.recipient} from JSON")
+            else:
+                logging.error(f"❌ No encryptedKey field found for {args.recipient}")
+                return
+        else:
+            logging.error(f"❌ Unrecognized JSON encrypted key format: {args.encrypted_key}")
             return
     else:
         # Load as binary file
@@ -967,20 +1280,24 @@ def main_decrypt(argv: Optional[List[str]] = None) -> None:
             return
     
     # Decrypt the AES key
-    try:
-        aes_key = decrypt_for_recipient(encrypted_aes_key, private_key, is_solana)
-        logging.info(f"✅ Decrypted AES key successfully")
-    except NotImplementedError as e:
-        logging.error(f"❌ {e}")
-        return
-    except Exception as e:
-        logging.error(f"❌ Failed to decrypt AES key: {e}")
-        logging.error(f"\nPossible causes:")
-        logging.error(f"  1. Wrong private key - Make sure you're using the {args.recipient}'s private key")
-        logging.error(f"  2. Key format mismatch - The encrypted key may have been encrypted with a different key type")
-        logging.error(f"  3. Corrupted encrypted key file")
-        logging.error(f"\nYou specified --recipient {args.recipient}, so you need the {args.recipient}'s private key.")
-        return
+    if aes_key is None:
+        if encrypted_aes_key is None:
+            logging.error("❌ Encrypted AES key payload not loaded; cannot proceed with decryption")
+            return
+        try:
+            aes_key = decrypt_for_recipient(encrypted_aes_key, private_key, is_solana)
+            logging.info("✅ Decrypted AES key successfully")
+        except NotImplementedError as e:
+            logging.error(f"❌ {e}")
+            return
+        except Exception as e:
+            logging.error(f"❌ Failed to decrypt AES key: {e}")
+            logging.error(f"\nPossible causes:")
+            logging.error(f"  1. Wrong private key - Make sure you're using the {args.recipient}'s private key")
+            logging.error(f"  2. Key format mismatch - The encrypted key may have been encrypted with a different key type")
+            logging.error(f"  3. Corrupted encrypted key file")
+            logging.error(f"\nYou specified --recipient {args.recipient}, so you need the {args.recipient}'s private key.")
+            return
     
     # Decrypt the file
     try:
