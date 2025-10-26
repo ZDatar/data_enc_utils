@@ -67,11 +67,26 @@ if TYPE_CHECKING:
     import rsa  # type: ignore
     from azure.storage.blob import BlobServiceClient  # type: ignore
     from nacl.signing import SigningKey as NaClSigningKey  # type: ignore
+    from typing import Any as _TypingAny
+    MemoryView = memoryview[_TypingAny]  # type: ignore[index]
 else:  # pragma: no cover - typing fallback
     NaClSigningKey = Any  # type: ignore
+    MemoryView = memoryview
 
 
-SolanaSecretSource = Union[bytes, bytearray, memoryview, NaClSigningKey]
+ByteLike = Union[bytes, bytearray, MemoryView]
+SolanaSecretSource = Union[ByteLike, NaClSigningKey]
+
+
+def _coerce_optional_bytes(source: object) -> Optional[bytes]:
+    """Return bytes from common buffer types, or None if unsupported."""
+    if isinstance(source, bytes):
+        return source
+    if isinstance(source, bytearray):
+        return bytes(source)
+    if isinstance(source, memoryview):
+        return source.tobytes()
+    return None
 
 # === CONFIGURATION ===
 # Default file paths - can be overridden via command-line arguments
@@ -220,12 +235,14 @@ def solana_private_to_x25519_private_bytes(private_key: Any) -> bytes:
     """
     candidate: Optional[bytes] = None
 
-    if isinstance(private_key, tuple) and len(private_key) >= 2:
-        maybe_bytes = private_key[1]
-        if isinstance(maybe_bytes, (bytes, bytearray, memoryview)):
-            candidate = bytes(maybe_bytes)
+    if isinstance(private_key, tuple):
+        private_key_tuple = cast(Tuple[Any, ...], private_key)
+        if len(private_key_tuple) >= 2:
+            maybe_bytes = _coerce_optional_bytes(private_key_tuple[1])
+            if maybe_bytes is not None:
+                candidate = maybe_bytes
     elif isinstance(private_key, (bytes, bytearray, memoryview)):
-        candidate = bytes(private_key)
+        candidate = _coerce_optional_bytes(cast(ByteLike, private_key))
     else:
         try:
             _nacl_signing = importlib.import_module('nacl.signing')  # type: ignore
@@ -365,7 +382,9 @@ def decrypt_multi_envelope(
     raise Exception(f"Unable to decrypt envelope for provided key. Last error: {last_err!r}")
 
 
-def build_solana_recipient_entries(label_to_public: Mapping[str, Union[str, bytes]]) -> List[Dict[str, Union[str, bytes]]]:
+def build_solana_recipient_entries(
+    label_to_public: Mapping[str, Union[str, ByteLike]]
+) -> List[Dict[str, Union[str, bytes]]]:
     """
     Convert a mapping of label -> Solana public key (base58 string or raw bytes)
     into recipient entries accepted by encrypt_multi.
@@ -386,10 +405,11 @@ def build_solana_recipient_entries(label_to_public: Mapping[str, Union[str, byte
             if not isinstance(decoded, (bytes, bytearray)):
                 raise ValueError(f"Decoded Solana public key for {label} is not bytes")
             raw_pub = bytes(decoded)
-        elif isinstance(value, (bytes, bytearray, memoryview)):
-            raw_pub = bytes(value)
         else:
-            raise TypeError(f"Unsupported Solana public key type for {label}: {type(value)!r}")
+            raw_candidate = _coerce_optional_bytes(cast(ByteLike, value))
+            if raw_candidate is None:
+                raise TypeError(f"Unsupported Solana public key type for {label}: {type(value)!r}")
+            raw_pub = raw_candidate
 
         if len(raw_pub) != 32:
             raise ValueError(f"Solana public key for {label} must be 32 bytes, got {len(raw_pub)} bytes")
@@ -1027,7 +1047,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     if args.encrypt_for in ('seller', 'both'):
         requested_labels.append('seller')
 
-    solana_pk_map: Dict[str, Union[str, bytes]] = {}
+    solana_pk_map: Dict[str, Union[str, ByteLike]] = {}
     rsa_pk_map: Dict[str, Any] = {}
     for label in requested_labels:
         pk_value = buyer_pk if label == 'buyer' else seller_pk
@@ -1036,8 +1056,12 @@ def main(argv: Optional[List[str]] = None) -> None:
             return
         if isinstance(pk_value, str):
             solana_pk_map[label] = pk_value
-        elif isinstance(pk_value, (bytes, bytearray, memoryview)) and len(pk_value) == 32:
-            solana_pk_map[label] = bytes(pk_value)
+        elif isinstance(pk_value, (bytes, bytearray, memoryview)):
+            pk_bytes = _coerce_optional_bytes(cast(ByteLike, pk_value))
+            if pk_bytes is not None and len(pk_bytes) == 32:
+                solana_pk_map[label] = pk_bytes
+            else:
+                rsa_pk_map[label] = pk_value
         else:
             rsa_pk_map[label] = pk_value
 
